@@ -1,129 +1,167 @@
 import os
 import time
 import random
-import io
-from playwright.sync_api import sync_playwright
+import json
+import threading
+from pyngrok import ngrok
+from flask import Flask, request
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from playwright.sync_api import sync_playwright
 
-# === CONFIG ===
-BASE_DIR = "/app"
-URLS_FILE = os.path.join(BASE_DIR, "product_urls.txt")
-NUM_GUESTS = 25
-PRODUCTS_PER_GUEST = 5
-TOTAL_DAYS = 60
-START_TIME = time.time()
+# ================================
+# CONFIGURATION
+# ================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+DRIVE_FILE_ID = '19FYL4wY2vN2vwJvPChSaqldElmvDFBgk'  # ← Yahan apna Google Drive file ID daal do
+GUEST_DELAY_MIN = 120  # 2 min gap
+GUEST_DELAY_MAX = 180  # 3 min gap
+HEADLESS = False  # ← Tumhara original: Real browser
 
-# ← YAHAN APNA GOOGLE DRIVE FILE ID DAALO
-DRIVE_FILE_ID = "19FYL4wY2vN2vwJvPChSaqldElmvDFBgk"  # ← CHANGE THIS!
+# ================================
+# FLASK + NGROK FOR OAUTH CALLBACK
+# ================================
+app = Flask(__name__)
+auth_code = None
 
-# === DOWNLOAD LIST FROM GOOGLE DRIVE ===
+@app.route('/oauth2callback')
+def oauth2callback():
+    global auth_code
+    code = request.args.get('code')
+    if code:
+        auth_code = code
+        return "<h1>Authorization successful!</h1><p>You can close this tab.</p>"
+    return "Error: No code received"
+
+def start_ngrok_and_server():
+    # Start Flask
+    flask_thread = threading.Thread(target=lambda: app.run(host='0.0.0.0', port=8080, use_reloader=False))
+    flask_thread.daemon = True
+    flask_thread.start()
+    
+    # Start ngrok
+    public_url = ngrok.connect(8080, bind_tls=True)
+    print(f"\nNGROK PUBLIC URL: {public_url}")
+    print(f"OAuth Redirect URI: {public_url}/oauth2callback\n")
+    return str(public_url)
+
+# ================================
+# GOOGLE DRIVE LIST DOWNLOADER
+# ================================
 def download_urls_from_drive():
+    global auth_code
     print("Google Drive se list download kar raha hun...")
-    SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+    
     creds = None
     token_path = os.path.join(BASE_DIR, 'token.json')
     creds_path = os.path.join(BASE_DIR, 'credentials.json')
 
+    # Start ngrok + flask
+    ngrok_url = start_ngrok_and_server()
+    
     if os.path.exists(token_path):
         creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+
     if not creds or not creds.valid:
-        if not os.path.exists(creds_path):
-            print("ERROR: credentials.json nahi mila! GitHub pe upload karo.")
-            return
-        flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
-        creds = flow.run_local_server(port=0)
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not os.path.exists(creds_path):
+                print("ERROR: credentials.json nahi mila! Upload karo.")
+                return None
+            
+            flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
+            flow.redirect_uri = f"{ngrok_url}/oauth2callback"
+            
+            auth_url, _ = flow.authorization_url(prompt='consent', access_type='offline')
+            print(f"\n1. Visit this URL: {auth_url}")
+            print("2. Allow access → Redirect hoga → Tab band kar do")
+            print("3. Wait 10 sec...\n")
+            
+            # Wait for code
+            timeout = 120
+            for _ in range(timeout):
+                if auth_code:
+                    break
+                time.sleep(1)
+            else:
+                print("ERROR: Authorization timeout!")
+                return None
+                
+            creds = flow.fetch_token(code=auth_code)
+            creds = Credentials.from_authorized_user_info(creds, SCOPES)
+
         with open(token_path, 'w') as token:
             token.write(creds.to_json())
 
     service = build('drive', 'v3', credentials=creds)
-    request = service.files().get_media(fileId=DRIVE_FILE_ID)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        status, done = downloader.next_chunk()
-    fh.seek(0)
-    with open(URLS_FILE, "wb") as f:
-        f.write(fh.read())
-    print("List updated from Google Drive!")
-
-# === LOAD URLS ===
-def load_urls():
-    if not os.path.exists(URLS_FILE):
-        download_urls_from_drive()
     try:
-        with open(URLS_FILE, "r", encoding="utf-8") as f:
-            return [line.strip() for line in f if line.strip() and "etsy.com/listing" in line]
-    except:
-        return []
+        results = service.files().get_media(fileId=DRIVE_FILE_ID).execute()
+        content = results.decode('utf-8').strip().split('\n')
+        urls = [line.strip() for line in content if line.strip() and 'etsy.com' in line]
+        print(f"{len(urls)} URLs loaded from Drive!")
+        return urls
+    except Exception as e:
+        print(f"Drive error: {e}")
+        return None
 
-# === GUEST FUNCTION ===
-def guest_multi_add(guest_id, urls):
-    if not urls:
-        return
-    selected = random.sample(urls, k=min(PRODUCTS_PER_GUEST, len(urls)))
-    print(f"\n[GUEST #{guest_id}] {len(selected)} products add kar raha...")
-
+# ================================
+# ETSY BOT CORE
+# ================================
+def run_etsy_bot(urls):
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=os.path.join(BASE_DIR, f"guest_{guest_id}"),
-            headless=False,
-            viewport={"width": 1366, "height": 768},
-            args=["--start-maximized", "--disable-blink-features=AutomationControlled"]
+        browser = p.chromium.launch(headless=HEADLESS)
+        context = browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         )
-        page = context.pages[0] if context.pages else context.new_page()
-        try:
-            for i, url in enumerate(selected):
-                page.goto(url, timeout=90000)
-                time.sleep(random.uniform(12, 20))
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.7)")
-                time.sleep(6)
+        page = context.new_page()
 
-                add_btn = page.locator('button:has-text("Add to basket"), button:has-text("Add to cart")').first
-                add_btn.wait_for(timeout=30000)
-                add_btn.click()
-                print(f" → Product {i+1} ADD! [{url.split('/')[-2]}]")
+        for idx, url in enumerate(urls):
+            try:
+                print(f"\n[GUEST #{idx+1}] Processing: {url}")
+                page.goto(url, timeout=60000)
+                time.sleep(5)
 
-                if i < len(selected) - 1:
-                    time.sleep(120)
-            print(f"GUEST #{guest_id} → DONE!")
-        except Exception as e:
-            print(f"ERROR (Guest {guest_id}): {e}")
-        finally:
-            context.close()
+                # Example: Add to cart (adjust selector as needed)
+                if page.locator("button[data-add-to-cart]").count() > 0:
+                    page.click("button[data-add-to-cart]")
+                    time.sleep(2)
+                    print("→ Product ADD ho gaya!")
+                else:
+                    print("→ Add button nahi mila")
 
-# === MAIN LOOP ===
-if __name__ == "__main__":
-    print(f"60 DAYS ETSY BOT SHURU! → {TOTAL_DAYS} din tak")
-    download_urls_from_drive()
+                # Random delay
+                delay = random.randint(GUEST_DELAY_MIN, GUEST_DELAY_MAX)
+                print(f"→ Waiting {delay//60} min...")
+                time.sleep(delay)
 
-    last_update = 0
+            except Exception as e:
+                print(f"Error on {url}: {e}")
+                time.sleep(10)
+
+        browser.close()
+        print("All guests completed!")
+
+# ================================
+# MAIN LOOP (60 DAYS)
+# ================================
+def main():
+    print("60 DAYS ETSY BOT SHURU! → 60 din tak")
+    
     while True:
-        elapsed_days = (time.time() - START_TIME) / (24 * 3600)
-        if elapsed_days >= TOTAL_DAYS:
-            print("60 din poore! Band ho raha.")
-            break
-
+        urls = download_urls_from_drive()
+        if urls:
+            run_etsy_bot(urls)
+        else:
+            print("No URLs – retry in 1 hour...")
+        
         # Har 6 ghante update
-        if time.time() - last_update > 6 * 3600:
-            download_urls_from_drive()
-            last_update = time.time()
+        print("6 ghante baad dobara shuru...")
+        time.sleep(6 * 60 * 60)
 
-        urls = load_urls()
-        if len(urls) < 2:
-            print("URLs nahi! 10 min wait...")
-            time.sleep(600)
-            continue
-
-        try:
-            for i in range(1, NUM_GUESTS + 1):
-                guest_multi_add(i, urls)
-                wait = random.uniform(1800, 5400)
-                print(f"Next guest in {wait/60:.0f} min...")
-                time.sleep(wait)
-        except Exception as e:
-            print(f"Crash! Restart in 60 sec... {e}")
-            time.sleep(60)
+if __name__ == "__main__":
+    main()
