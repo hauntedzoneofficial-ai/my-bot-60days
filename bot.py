@@ -3,6 +3,7 @@ import time
 import random
 import json
 import threading
+import requests
 from pyngrok import ngrok
 from flask import Flask, request
 from google.auth.transport.requests import Request
@@ -16,10 +17,10 @@ from playwright.sync_api import sync_playwright
 # ================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
-DRIVE_FILE_ID = '19FYL4wY2vN2vwJvPChSaqldElmvDFBgk'  # ← Yahan apna Google Drive file ID daal do
-GUEST_DELAY_MIN = 120  # 2 min gap
-GUEST_DELAY_MAX = 180  # 3 min gap
-HEADLESS = False  # ← Tumhara original: Real browser
+DRIVE_FILE_ID = '19FYL4wY2vN2vwJvPChSaqldElmvDFBgk'  # ← YAHAN APNA DRIVE FILE ID DAAL DO
+GUEST_DELAY_MIN = 120  # 2 min
+GUEST_DELAY_MAX = 180  # 3 min
+HEADLESS = False  # ← Real browser (tumhara original)
 
 # ================================
 # FLASK + NGROK FOR OAUTH CALLBACK
@@ -33,70 +34,117 @@ def oauth2callback():
     code = request.args.get('code')
     if code:
         auth_code = code
-        return "<h1>Authorization successful!</h1><p>You can close this tab.</p>"
-    return "Error: No code received"
+        return """
+        <h1>Authorization Successful!</h1>
+        <p>Token received. You can close this tab.</p>
+        <script>window.close();</script>
+        """
+    return "Error: No code received."
 
 def start_ngrok_and_server():
-    # Start Flask
-    flask_thread = threading.Thread(target=lambda: app.run(host='0.0.0.0', port=8080, use_reloader=False))
+    # Start Flask in background
+    flask_thread = threading.Thread(
+        target=lambda: app.run(host='0.0.0.0', port=8080, use_reloader=False, debug=False)
+    )
     flask_thread.daemon = True
     flask_thread.start()
     
     # Start ngrok
     public_url = ngrok.connect(8080, bind_tls=True)
     print(f"\nNGROK PUBLIC URL: {public_url}")
-    print(f"OAuth Redirect URI: {public_url}/oauth2callback\n")
+    print(f"OAuth Redirect: {public_url}/oauth2callback\n")
     return str(public_url)
 
 # ================================
-# GOOGLE DRIVE LIST DOWNLOADER
+# GOOGLE DRIVE LIST DOWNLOADER (DYNAMIC REDIRECT)
 # ================================
 def download_urls_from_drive():
     global auth_code
+    auth_code = None  # Reset
     print("Google Drive se list download kar raha hun...")
     
     creds = None
     token_path = os.path.join(BASE_DIR, 'token.json')
     creds_path = os.path.join(BASE_DIR, 'credentials.json')
 
-    # Start ngrok + flask
+    # Start ngrok + Flask
     ngrok_url = start_ngrok_and_server()
     
+    # Load existing token
     if os.path.exists(token_path):
         creds = Credentials.from_authorized_user_file(token_path, SCOPES)
 
+    # Refresh or new auth
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except:
+                creds = None
+
+        if not creds:
             if not os.path.exists(creds_path):
-                print("ERROR: credentials.json nahi mila! Upload karo.")
+                print("ERROR: credentials.json upload karo!")
                 return None
             
-            flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
-            flow.redirect_uri = f"{ngrok_url}/oauth2callback"
+            # Load client config
+            with open(creds_path) as f:
+                client_config = json.load(f)['web']  # Web app type
+
+            # Build auth URL with dynamic redirect
+            redirect_uri = f"{ngrok_url}/oauth2callback"
+            auth_url = (
+                f"https://accounts.google.com/o/oauth2/auth?"
+                f"client_id={client_config['client_id']}&"
+                f"redirect_uri={redirect_uri}&"
+                f"response_type=code&"
+                f"scope={' '.join(SCOPES)}&"
+                f"access_type=offline&prompt=consent"
+            )
             
-            auth_url, _ = flow.authorization_url(prompt='consent', access_type='offline')
-            print(f"\n1. Visit this URL: {auth_url}")
-            print("2. Allow access → Redirect hoga → Tab band kar do")
-            print("3. Wait 10 sec...\n")
-            
+            print(f"1. Visit: {auth_url}")
+            print("2. Allow access → Redirect hoga")
+            print("3. Wait 15 sec...\n")
+
             # Wait for code
-            timeout = 120
-            for _ in range(timeout):
+            for _ in range(120):
                 if auth_code:
                     break
                 time.sleep(1)
             else:
                 print("ERROR: Authorization timeout!")
                 return None
-                
-            creds = flow.fetch_token(code=auth_code)
-            creds = Credentials.from_authorized_user_info(creds, SCOPES)
 
+            # Exchange code for token
+            token_response = requests.post(
+                'https://oauth2.googleapis.com/token',
+                data={
+                    'code': auth_code,
+                    'client_id': client_config['client_id'],
+                    'client_secret': client_config['client_secret'],
+                    'redirect_uri': redirect_uri,
+                    'grant_type': 'authorization_code'
+                }
+            ).json()
+
+            if 'error' in token_response:
+                print(f"Token error: {token_response}")
+                return None
+
+            creds = Credentials(
+                token=token_response.get('access_token'),
+                refresh_token=token_response.get('refresh_token'),
+                token_uri='https://oauth2.googleapis.com/token',
+                client_id=client_config['client_id'],
+                client_secret=client_config['client_secret'],
+                scopes=SCOPES
+            )
+
+        # Save token
         with open(token_path, 'w') as token:
             token.write(creds.to_json())
 
+    # Download file
     service = build('drive', 'v3', credentials=creds)
     try:
         results = service.files().get_media(fileId=DRIVE_FILE_ID).execute()
@@ -123,10 +171,10 @@ def run_etsy_bot(urls):
         for idx, url in enumerate(urls):
             try:
                 print(f"\n[GUEST #{idx+1}] Processing: {url}")
-                page.goto(url, timeout=60000)
+                page.goto(url, timeout=90000)
                 time.sleep(5)
 
-                # Example: Add to cart (adjust selector as needed)
+                # Example: Add to cart (adjust selector)
                 if page.locator("button[data-add-to-cart]").count() > 0:
                     page.click("button[data-add-to-cart]")
                     time.sleep(2)
@@ -134,17 +182,16 @@ def run_etsy_bot(urls):
                 else:
                     print("→ Add button nahi mila")
 
-                # Random delay
                 delay = random.randint(GUEST_DELAY_MIN, GUEST_DELAY_MAX)
                 print(f"→ Waiting {delay//60} min...")
                 time.sleep(delay)
 
             except Exception as e:
-                print(f"Error on {url}: {e}")
+                print(f"Error: {e}")
                 time.sleep(10)
 
         browser.close()
-        print("All guests completed!")
+        print("All guests done!")
 
 # ================================
 # MAIN LOOP (60 DAYS)
@@ -159,9 +206,8 @@ def main():
         else:
             print("No URLs – retry in 1 hour...")
         
-        # Har 6 ghante update
-        print("6 ghante baad dobara shuru...")
-        time.sleep(6 * 60 * 60)
+        print("6 ghante baad dobara...")
+        time.sleep(6 * 60 * 60)  # 6 hours
 
 if __name__ == "__main__":
     main()
