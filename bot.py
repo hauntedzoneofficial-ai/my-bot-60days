@@ -17,7 +17,7 @@ from playwright.sync_api import sync_playwright
 # ================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
-DRIVE_FILE_ID = '19FYL4wY2vN2vwJvPChSaqldElmvDFBgk'  # ← YAHAN APNA DRIVE FILE ID DAAL DO
+DRIVE_FILE_ID = '1ABC123xyzYOURFILEIDHERE'  # ← YAHAN APNA DRIVE FILE ID DAAL DO
 GUEST_DELAY_MIN = 120  # 2 min
 GUEST_DELAY_MAX = 180  # 3 min
 HEADLESS = False  # ← Real browser (tumhara original)
